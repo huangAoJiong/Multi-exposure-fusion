@@ -1,0 +1,196 @@
+function [returnW,fused,J] = bio_MEF(I, mu, k, a, b)
+%%
+% @article{ying2017bio,
+%   title={A Bio-Inspired Multi-Exposure Fusion Framework for Low-light Image Enhancement},
+%   author={Ying, Zhenqiang and Li, Ge and Gao, Wen},
+%   journal={arXiv preprint arXiv:1711.00591},
+%   year={2017}
+% }
+% % @inproceedings{ying2017new,
+% %   title={A New Image Contrast Enhancement Algorithm Using Exposure Fusion Framework},
+%   author={Ying, Zhenqiang and Li, Ge and Ren, Yurui and Wang, Ronggang and Wang, Wenmin},
+%   booktitle={International Conference on Computer Analysis of Images and Patterns},
+%   pages={36--46},
+%   year={2017},
+%   organization={Springer}
+% }
+%USAGE
+% I = imread('yellowlily.jpg');
+% J = BIMEF(I); 
+% subplot 121; imshow(I); title('Original Image');
+% subplot 122; imshow(J); title('Enhanced Result');
+%
+%INPUTS
+% I: 	image data (of an RGB or grayscale image)
+% mu: 	enhancement ratio
+% k:    exposure ratio
+% a, b: camera response model params
+%
+%OUTPUTS
+% fused: enhanced result
+%
+% Please feel free to contact me (yingzhenqiang-at-gmail-dot-com) if you
+% have any questions or concerns.
+
+if  ~exist( 'mu', 'var' )
+    mu = 0.5;
+end
+
+if ~exist( 'a', 'var' )
+    a = -0.3293;
+end
+
+if ~exist( 'b', 'var' )
+    b = 1.1258;
+end
+
+if ~isfloat(I)
+    I = im2double( I );
+end
+
+lambda = 0.5;
+sigma = 5;
+
+%% t: scene illumination map
+t_b = max( I, [], 3 ); % also work for single-channel image
+S = tsmooth( imresize( t_b, 0.5 ), lambda, sigma );
+t_our =  imresize(S , size( t_b ) );
+
+%% k: exposure ratio
+if  ~exist( 'k', 'var' ) || isempty(k)
+    isBad = t_our < 0.5;
+    J = maxEntropyEnhance(I, isBad);
+else
+    J = applyK(I, k, a, b); %k
+    J = min(J, 1); % fix overflow
+end
+
+%% W: Weight Matrix 
+t = repmat(t_our, [1 1 size(I,3)]);%t是优化后得到的照度图
+returnW = t_our.^mu;
+W = t.^mu;%W是根据照度图得到的融合权重
+
+I2 = I.*W;
+J2 = J.*(1-W);
+
+fused = I2 + J2;
+
+    function J = maxEntropyEnhance(I, isBad)
+        Y = rgb2gm(real(max(imresize(I, [50 50]), 0))); % max - avoid complex number
+        
+        if exist('isBad', 'var')
+            isBad = (imresize(isBad, [50 50]));
+            Y = Y(isBad);
+        end
+        
+        if isempty(Y)
+            J = I; % no enhancement k = 1
+            return;
+        end
+        %MATLAB工具箱在一维优化问题中的应用——fminbnd
+        opt_k = fminbnd(@(k) ( -entropy(applyK(Y, k)) ),1, 7);
+        J = applyK(I, opt_k, a, b) - 0.01;
+        
+    end
+end
+
+function I = rgb2gm(I)
+if size(I,3) == 3
+    I = im2double(max(0,I)); % negative double --> complex double
+    I = ( I(:,:,1).*I(:,:,2).*I(:,:,3) ).^(1/3);
+end
+end
+
+function J = applyK(I, k, a, b)
+
+if ~exist( 'a', 'var' )
+    a = -0.3293;
+end
+
+if ~exist( 'b', 'var' )
+    b = 1.1258;
+end
+
+f = @(x)exp((1-x.^a)*b);
+beta = f(k);
+gamma = k.^a;
+J = I.^gamma.*beta;
+end
+
+function S = tsmooth( I, lambda, sigma, sharpness)
+if ( ~exist( 'lambda', 'var' ) )
+    lambda = 0.01;
+end
+if ( ~exist( 'sigma', 'var' ) )
+    sigma = 3.0;
+end
+if ( ~exist( 'sharpness', 'var' ) )
+    sharpness = 0.001;
+end
+I = im2double( I );
+x = I;
+[ wx, wy ] = computeTextureWeights( x, sigma, sharpness);
+S = solveLinearEquation( I, wx, wy, lambda );%S就是优化出来的照度图T
+end
+
+% compute texture weight 计算结构重量 
+% min ∣T−L∣ 2 +λ∣M∘∇T∣ 
+%M_d(x)= 1/（∣Σ∇ d,h​ L(x)∣+ϵ）  d∈（h，v）
+%求的是该式子的M ,M为权值矩阵
+%M（权重）的设计对于光照图的细化非常重要。局部窗口的主边缘比带有复杂图案的纹理具有更相似的方向梯度。
+%因此，包含有意义的边的窗口的权重应该比只包含纹理的窗口的权重小。
+function [ W_h, W_v ] = computeTextureWeights( fin, sigma, sharpness)
+
+dt0_v = [diff(fin,1,1);fin(1,:)-fin(end,:)];
+dt0_h = [diff(fin,1,2)';fin(:,1)'-fin(:,end)']';
+
+gauker_h = filter2(ones(1,sigma),dt0_h);
+gauker_v = filter2(ones(sigma,1),dt0_v);
+W_h = 1./(abs(gauker_h).*abs(dt0_h)+sharpness);
+W_v = 1./(abs(gauker_v).*abs(dt0_v)+sharpness);
+
+end
+% solve Linear Equation :解线性方程
+%得到-->优化方程来细化T
+function OUT = solveLinearEquation( IN, wx, wy, lambda )
+[ r, c, ch ] = size( IN );
+k = r * c;
+dx =  -lambda * wx( : );
+dy =  -lambda * wy( : );
+tempx = [wx(:,end),wx(:,1:end-1)];
+tempy = [wy(end,:);wy(1:end-1,:)];
+dxa = -lambda *tempx(:);
+dya = -lambda *tempy(:);
+tempx = [wx(:,end),zeros(r,c-1)];
+tempy = [wy(end,:);zeros(r-1,c)];
+dxd1 = -lambda * tempx(:);
+dyd1 = -lambda * tempy(:);
+wx(:,end) = 0;
+wy(end,:) = 0;
+dxd2 = -lambda * wx(:);
+dyd2 = -lambda * wy(:);
+
+Ax = spdiags( [dxd1,dxd2], [-k+r,-r], k, k );
+Ay = spdiags( [dyd1,dyd2], [-r+1,-1], k, k );
+
+D = 1 - ( dx + dy + dxa + dya);
+A = (Ax+Ay) + (Ax+Ay)' + spdiags( D, 0, k, k );
+
+if exist( 'ichol', 'builtin' )
+    L = ichol( A, struct( 'michol', 'on' ) );
+    OUT = IN;
+    for ii = 1:ch
+        tin = IN( :, :, ii );
+        [ tout, ~ ] = pcg( A, tin( : ), 0.1, 50, L, L' );
+        OUT( :, :, ii ) = reshape( tout, r, c );
+    end
+else
+    OUT = IN;
+    for ii = 1:ch
+        tin = IN( :, :, ii );
+        tout = A\tin( : );
+        OUT( :, :, ii ) = reshape( tout, r, c );
+    end
+end
+end
+
